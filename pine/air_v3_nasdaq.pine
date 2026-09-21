@@ -1,0 +1,469 @@
+//@version=6
+// =============================================================================
+//  AIR V3 — Average Intraday Range  (inspiré de l'AIR V3 de Romain Bailleul)
+// -----------------------------------------------------------------------------
+//  Deux blocs indépendants, activables séparément :
+//
+//  BLOC 1 — Bandes AIR (projection intraday)
+//    Sur les N dernières séances (60 par défaut) on mesure, à partir des données
+//    journalières Open / High / Low :
+//        Range      = High - Low
+//        High-Open  = High - Open   (excursion haussière depuis l'open)
+//        Open-Low   = Open - Low    (excursion baissière depuis l'open)
+//    On en tire une tendance centrale (moyenne, médiane ou moyenne tronquée) que
+//    l'on projette sur l'open de la séance en cours :
+//        AIR High = Open + moy(High-Open)
+//        AIR Low  = Open - moy(Open-Low)
+//    Remarque : moy(High-Open) + moy(Open-Low) = moy(Range), la largeur de la
+//    projection est donc toujours égale au range moyen (cf. 200.25 + 163.25 = 363.50).
+//
+//  BLOC 2 — Moyenne N séances de (Open+High+Low)/3
+//    Moyenne du prix typique journalier sur les N dernières séances, encadrée par
+//    ses écarts-types : les zones au-dessus de +1σ / +2σ (resp. sous -1σ / -2σ)
+//    identifient les moments où le Nasdaq est statistiquement plus haut (resp.
+//    plus bas) que sa moyenne habituelle.
+//
+//  Non-repaint : toutes les statistiques n'utilisent que des séances CLOTUREES
+//  (décalage [1] et suivants). Les valeurs sont donc figées pour toute la séance.
+// =============================================================================
+
+indicator("AIR V3 — Average Intraday Range", "AIR V3", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 600)
+
+// =============================================================================
+//  INPUTS
+// =============================================================================
+G_CALC = "1 · Calcul"
+lookback   = input.int(60, "Séances analysées", minval = 2, maxval = 500, group = G_CALC,
+     tooltip = "Nombre de séances clôturées utilisées pour les statistiques AIR.")
+methodStr  = input.string("Moyenne", "Tendance centrale", options = ["Moyenne", "Médiane", "Moyenne tronquée"], group = G_CALC,
+     tooltip = "La médiane et la moyenne tronquée réduisent l'influence des séances extrêmes (CPI, FOMC, NFP...).")
+trimPct    = input.float(10.0, "Troncature (%)", minval = 0.0, maxval = 40.0, step = 1.0, group = G_CALC,
+     tooltip = "Pourcentage écarté de chaque côté de la distribution en mode 'Moyenne tronquée'.")
+sessMode   = input.string("Bougie journalière (D)", "Définition de la séance", options = ["Bougie journalière (D)", "Session personnalisée"], group = G_CALC,
+     tooltip = "Bougie journalière = séance complète du symbole (ETH pour NQ). Session personnalisée = plage horaire au choix (RTH...).")
+sessStr    = input.session("0930-1600", "Session personnalisée", group = G_CALC)
+sessTz     = input.string("America/New_York", "Fuseau de la session", group = G_CALC)
+
+G_BAND = "2 · Bandes AIR"
+showBands  = input.bool(true, "Afficher les bandes AIR", group = G_BAND)
+bandMode   = input.string("Open-based", "Mode bandes", options = ["Open-based", "Symétrique (Range/2)", "Clôture veille ± Range/2"], group = G_BAND,
+     tooltip = "Open-based : Open ± excursions moyennes (mode d'origine AIR V3).")
+showExt    = input.bool(true, "Bandes d'extension statistique", group = G_BAND,
+     tooltip = "Zone rarement atteinte : au-delà, la séance est statistiquement étendue.")
+extMode    = input.string("Percentile", "Calcul de l'extension", options = ["Percentile", "Écart-type (+1σ)"], group = G_BAND)
+extPct     = input.float(80.0, "Percentile d'extension", minval = 50.0, maxval = 99.0, step = 1.0, group = G_BAND)
+showOpenZn = input.bool(true, "Zone d'équilibre autour de l'open", group = G_BAND)
+openZnPct  = input.float(8.0, "Largeur de la zone (% du range moyen)", minval = 1.0, maxval = 50.0, step = 1.0, group = G_BAND)
+showFib    = input.bool(false, "Niveaux Fibonacci de la projection", group = G_BAND)
+
+G_MA   = "3 · Moyenne N séances (O+H+L)/3"
+showMa     = input.bool(true, "Afficher la moyenne", group = G_MA)
+maLen      = input.int(60, "Séances", minval = 2, maxval = 500, group = G_MA)
+showMaDev  = input.bool(true, "Afficher les écarts (±σ)", group = G_MA)
+devMult1   = input.float(1.0, "Écart 1 (σ)", minval = 0.25, maxval = 5.0, step = 0.25, group = G_MA)
+devMult2   = input.float(2.0, "Écart 2 (σ)", minval = 0.25, maxval = 6.0, step = 0.25, group = G_MA)
+
+G_UI   = "4 · Affichage"
+showTable  = input.bool(true, "Tableau statistique", group = G_UI)
+tblPosStr  = input.string("bottom_right", "Position du tableau", options = ["top_right", "middle_right", "bottom_right", "top_left", "bottom_left"], group = G_UI)
+tblSizeStr = input.string("small", "Taille du texte", options = ["tiny", "small", "normal"], group = G_UI)
+showLabels = input.bool(true, "Étiquettes de prix", group = G_UI)
+extendBars = input.int(12, "Prolongement à droite (bougies)", minval = 0, maxval = 200, group = G_UI)
+colHi      = input.color(color.new(#00bcd4, 0),  "Couleur bande haute", group = G_UI, inline = "c1")
+colLo      = input.color(color.new(#ef5350, 0),  "basse", group = G_UI, inline = "c1")
+colOpen    = input.color(color.new(#ffc107, 0),  "Couleur open", group = G_UI, inline = "c2")
+colMa      = input.color(color.new(#9c27b0, 0),  "moyenne", group = G_UI, inline = "c2")
+fillTransp = input.int(92, "Transparence des zones", minval = 50, maxval = 100, group = G_UI)
+
+// =============================================================================
+//  FONCTIONS STATISTIQUES
+// =============================================================================
+
+// Tendance centrale d'un tableau selon la méthode choisie.
+f_central(a, meth, trim) =>
+    float res = na
+    int n = array.size(a)
+    if n > 0
+        if meth == "Médiane"
+            res := array.median(a)
+        else if meth == "Moyenne tronquée"
+            s = array.copy(a)
+            array.sort(s, order.ascending)
+            int k = int(math.floor(n * trim / 100.0))
+            if n - 2 * k <= 0
+                res := array.avg(s)
+            else
+                float sum = 0.0
+                for i = k to n - 1 - k
+                    sum += array.get(s, i)
+                res := sum / (n - 2 * k)
+        else
+            res := array.avg(a)
+    res
+
+// Pourcentage d'éléments supérieurs ou égaux à un seuil.
+f_shareAbove(a, thr) =>
+    int n = array.size(a)
+    float res = na
+    if n > 0 and not na(thr)
+        float c = 0.0
+        for i = 0 to n - 1
+            if array.get(a, i) >= thr
+                c += 1.0
+        res := c / n * 100.0
+    res
+
+// Seuil d'extension : percentile de la distribution ou tendance centrale + 1σ.
+f_extension(a, mode, pct, centralVal) =>
+    float res = na
+    if array.size(a) > 1
+        res := mode == "Percentile" ? array.percentile_linear_interpolation(a, pct) : centralVal + array.stdev(a)
+    res
+
+// Copie des n derniers éléments d'un tableau.
+f_tail(a, n) =>
+    out = array.new<float>()
+    int sz = array.size(a)
+    if sz > 0
+        int st = math.max(0, sz - n)
+        for i = st to sz - 1
+            array.push(out, array.get(a, i))
+    out
+
+// Bloc statistique complet à partir des distributions Range / High-Open / Open-Low.
+f_bundle(aR, aHO, aLO, meth, trim, xMode, xPct) =>
+    cR  = f_central(aR,  meth, trim)
+    cHO = f_central(aHO, meth, trim)
+    cLO = f_central(aLO, meth, trim)
+    sHO = array.size(aHO) > 1 ? array.stdev(aHO) : na
+    sLO = array.size(aLO) > 1 ? array.stdev(aLO) : na
+    tHi = f_shareAbove(aHO, cHO)
+    tLo = f_shareAbove(aLO, cLO)
+    eHi = f_extension(aHO, xMode, xPct, cHO)
+    eLo = f_extension(aLO, xMode, xPct, cLO)
+    [array.size(aR), cR, cHO, cLO, sHO, sLO, tHi, tLo, eHi, eLo]
+
+// --- Contexte journalier : uniquement des séances clôturées (décalages >= 1) ---
+f_dailyAir(len, meth, trim, xMode, xPct) =>
+    aR  = array.new<float>()
+    aHO = array.new<float>()
+    aLO = array.new<float>()
+    for i = 1 to len
+        float o = open[i]
+        float h = high[i]
+        float l = low[i]
+        if not na(o) and not na(h) and not na(l)
+            array.push(aR,  h - l)
+            array.push(aHO, math.max(h - o, 0.0))
+            array.push(aLO, math.max(o - l, 0.0))
+    f_bundle(aR, aHO, aLO, meth, trim, xMode, xPct)
+
+f_dailyMean(len) =>
+    aT = array.new<float>()
+    for i = 1 to len
+        float o = open[i]
+        float h = high[i]
+        float l = low[i]
+        if not na(o) and not na(h) and not na(l)
+            array.push(aT, (o + h + l) / 3.0)
+    float m = array.size(aT) > 0 ? array.avg(aT) : na
+    float s = array.size(aT) > 1 ? array.stdev(aT) : na
+    float p = f_shareAbove(aT, m)
+    [m, s, p]
+
+// =============================================================================
+//  SUIVI DE LA SÉANCE EN COURS (calculé nativement : aucun repaint)
+// =============================================================================
+useCustom = sessMode == "Session personnalisée"
+inSess    = useCustom ? not na(time(timeframe.period, sessStr, sessTz)) : true
+newSess   = useCustom ? (inSess and not inSess[1]) : timeframe.change("D")
+sessEnded = useCustom ? (not inSess and inSess[1]) : timeframe.change("D")
+
+var float sOpen  = na
+var float sHigh  = na
+var float sLow   = na
+var float sClose = na
+var float pOpen  = na   // séance précédente (figée)
+var float pHigh  = na
+var float pLow   = na
+var float pClose = na
+var int   sIdx   = na
+
+// À la clôture d'une séance on fige ses valeurs avant toute réinitialisation.
+if sessEnded and not na(sOpen)
+    pOpen  := sOpen
+    pHigh  := sHigh
+    pLow   := sLow
+    pClose := sClose
+
+if newSess
+    sOpen := open
+    sHigh := high
+    sLow  := low
+    sIdx  := bar_index
+else if inSess
+    sHigh := math.max(nz(sHigh, high), high)
+    sLow  := math.min(nz(sLow, low), low)
+
+if inSess
+    sClose := close
+
+// =============================================================================
+//  HISTORIQUE DES SÉANCES (mode session personnalisée)
+// =============================================================================
+maxKeep = math.max(lookback, maLen)
+var aRn  = array.new<float>()
+var aHOn = array.new<float>()
+var aLOn = array.new<float>()
+var aTn  = array.new<float>()
+var bool firstDone = false
+
+if useCustom and sessEnded and not na(pOpen)
+    if firstDone
+        array.push(aRn,  pHigh - pLow)
+        array.push(aHOn, math.max(pHigh - pOpen, 0.0))
+        array.push(aLOn, math.max(pOpen - pLow, 0.0))
+        array.push(aTn,  (pOpen + pHigh + pLow) / 3.0)
+        if array.size(aRn) > maxKeep
+            array.shift(aRn)
+            array.shift(aHOn)
+            array.shift(aLOn)
+            array.shift(aTn)
+    firstDone := true
+
+var float st_n   = na
+var float st_cR  = na
+var float st_cHO = na
+var float st_cLO = na
+var float st_sHO = na
+var float st_sLO = na
+var float st_tHi = na
+var float st_tLo = na
+var float st_eHi = na
+var float st_eLo = na
+var float st_ma  = na
+var float st_sd  = na
+var float st_pa  = na
+
+if useCustom and sessEnded and array.size(aRn) > 0
+    [b_n, b_cR, b_cHO, b_cLO, b_sHO, b_sLO, b_tHi, b_tLo, b_eHi, b_eLo] =
+         f_bundle(f_tail(aRn, lookback), f_tail(aHOn, lookback), f_tail(aLOn, lookback), methodStr, trimPct, extMode, extPct)
+    st_n   := b_n
+    st_cR  := b_cR
+    st_cHO := b_cHO
+    st_cLO := b_cLO
+    st_sHO := b_sHO
+    st_sLO := b_sLO
+    st_tHi := b_tHi
+    st_tLo := b_tLo
+    st_eHi := b_eHi
+    st_eLo := b_eLo
+    tTail = f_tail(aTn, maLen)
+    st_ma := array.size(tTail) > 0 ? array.avg(tTail) : na
+    st_sd := array.size(tTail) > 1 ? array.stdev(tTail) : na
+    st_pa := f_shareAbove(tTail, st_ma)
+
+// =============================================================================
+//  STATISTIQUES EN MODE BOUGIE JOURNALIÈRE
+//  lookahead_on + décalages [1..N] = valeur de la journée en cours connue dès
+//  l'ouverture et construite uniquement sur des séances clôturées => non-repaint.
+// =============================================================================
+[d_n, d_cR, d_cHO, d_cLO, d_sHO, d_sLO, d_tHi, d_tLo, d_eHi, d_eLo] =
+     request.security(syminfo.tickerid, "D", f_dailyAir(lookback, methodStr, trimPct, extMode, extPct), lookahead = barmerge.lookahead_on)
+[d_ma, d_sd, d_pa] = request.security(syminfo.tickerid, "D", f_dailyMean(maLen), lookahead = barmerge.lookahead_on)
+
+nUsed = useCustom ? st_n   : d_n
+cR    = useCustom ? st_cR  : d_cR
+cHO   = useCustom ? st_cHO : d_cHO
+cLO   = useCustom ? st_cLO : d_cLO
+sdHO  = useCustom ? st_sHO : d_sHO
+sdLO  = useCustom ? st_sLO : d_sLO
+tchHi = useCustom ? st_tHi : d_tHi
+tchLo = useCustom ? st_tLo : d_tLo
+extHO = useCustom ? st_eHi : d_eHi
+extLO = useCustom ? st_eLo : d_eLo
+maVal = useCustom ? st_ma  : d_ma
+sdVal = useCustom ? st_sd  : d_sd
+pctAb = useCustom ? st_pa  : d_pa
+
+// =============================================================================
+//  PROJECTIONS DE LA SÉANCE
+// =============================================================================
+float hiBand = na
+float loBand = na
+if not na(cR)
+    if bandMode == "Open-based"
+        hiBand := sOpen + cHO
+        loBand := sOpen - cLO
+    else if bandMode == "Symétrique (Range/2)"
+        hiBand := sOpen + cR / 2.0
+        loBand := sOpen - cR / 2.0
+    else
+        hiBand := pClose + cR / 2.0
+        loBand := pClose - cR / 2.0
+
+midBand   = na(hiBand) or na(loBand) ? na : (hiBand + loBand) / 2.0
+extHiPx   = na(extHO) ? na : sOpen + extHO
+extLoPx   = na(extLO) ? na : sOpen - extLO
+znW       = na(cR) ? na : cR * openZnPct / 100.0
+znHi      = sOpen + znW
+znLo      = sOpen - znW
+
+// Comportement de la séance en cours par rapport à la moyenne
+upUsed    = na(cHO) or cHO == 0 ? na : (sHigh - sOpen) / cHO * 100.0   // % de l'excursion haussière moyenne
+dnUsed    = na(cLO) or cLO == 0 ? na : (sOpen - sLow) / cLO * 100.0
+rangeUsed = na(cR)  or cR  == 0 ? na : (sHigh - sLow)  / cR  * 100.0
+zUp       = na(sdHO) or sdHO == 0 ? na : ((sHigh - sOpen) - cHO) / sdHO
+zDn       = na(sdLO) or sdLO == 0 ? na : ((sOpen - sLow) - cLO) / sdLO
+
+// Écart par rapport à la moyenne N séances
+devPts    = na(maVal) ? na : close - maVal
+devPct    = na(maVal) or maVal == 0 ? na : devPts / maVal * 100.0
+devZ      = na(sdVal) or sdVal == 0 ? na : devPts / sdVal
+
+// =============================================================================
+//  TRACÉS
+// =============================================================================
+plotOk = showBands and not na(cR)
+
+pHi = plot(plotOk ? hiBand : na, "AIR High", color = colHi,   linewidth = 2, style = plot.style_stepline)
+pLo = plot(plotOk ? loBand : na, "AIR Low",  color = colLo,   linewidth = 2, style = plot.style_stepline)
+pOp = plot(plotOk ? sOpen  : na, "Open séance", color = colOpen, linewidth = 1, style = plot.style_stepline)
+pMd = plot(plotOk ? midBand : na, "Milieu de projection", color = color.new(color.gray, 40), linewidth = 1, style = plot.style_stepline, display = display.none)
+
+fill(pHi, pOp, color = color.new(colHi, fillTransp), title = "Zone haute")
+fill(pOp, pLo, color = color.new(colLo, fillTransp), title = "Zone basse")
+
+pEh = plot(plotOk and showExt ? extHiPx : na, "Extension haute", color = color.new(colHi, 35), linewidth = 1, style = plot.style_stepline)
+pEl = plot(plotOk and showExt ? extLoPx : na, "Extension basse", color = color.new(colLo, 35), linewidth = 1, style = plot.style_stepline)
+fill(pEh, pHi, color = color.new(colHi, math.max(fillTransp - 6, 50)), title = "Zone d'extension haute")
+fill(pLo, pEl, color = color.new(colLo, math.max(fillTransp - 6, 50)), title = "Zone d'extension basse")
+
+pZh = plot(plotOk and showOpenZn ? znHi : na, "Zone open +", color = color.new(#4caf50, 60), style = plot.style_stepline)
+pZl = plot(plotOk and showOpenZn ? znLo : na, "Zone open -", color = color.new(#4caf50, 60), style = plot.style_stepline)
+fill(pZh, pZl, color = color.new(#4caf50, math.max(fillTransp - 10, 50)), title = "Zone d'équilibre")
+
+// --- Bloc moyenne N séances + écarts ---
+maOk = showMa and not na(maVal)
+pMa  = plot(maOk ? maVal : na, "Moyenne (O+H+L)/3", color = colMa, linewidth = 2)
+pU1  = plot(maOk and showMaDev ? maVal + devMult1 * sdVal : na, "+1σ", color = color.new(colMa, 55))
+pD1  = plot(maOk and showMaDev ? maVal - devMult1 * sdVal : na, "-1σ", color = color.new(colMa, 55))
+pU2  = plot(maOk and showMaDev ? maVal + devMult2 * sdVal : na, "+2σ", color = color.new(colMa, 75))
+pD2  = plot(maOk and showMaDev ? maVal - devMult2 * sdVal : na, "-2σ", color = color.new(colMa, 75))
+fill(pU1, pU2, color = color.new(#26a69a, math.max(fillTransp - 10, 50)), title = "Écart positif (statistiquement haut)")
+fill(pD1, pD2, color = color.new(#ef5350, math.max(fillTransp - 10, 50)), title = "Écart négatif (statistiquement bas)")
+
+// =============================================================================
+//  LIGNES, ÉTIQUETTES ET FIBONACCI DE LA SÉANCE EN COURS
+// =============================================================================
+f_px(v) => na(v) ? "n/a" : str.tostring(v, format.mintick)
+f_pt(v) => na(v) ? "n/a" : str.tostring(v, "#.##")
+f_pc(v) => na(v) ? "n/a" : str.tostring(v, "#") + " %"
+
+var line  lnHi = na
+var line  lnLo = na
+var label lbHi = na
+var label lbLo = na
+var label lbOp = na
+var fibLines  = array.new<line>()
+var fibLabels = array.new<label>()
+
+if barstate.islast
+    line.delete(lnHi)
+    line.delete(lnLo)
+    label.delete(lbHi)
+    label.delete(lbLo)
+    label.delete(lbOp)
+    for i = 0 to array.size(fibLines) - 1
+        line.delete(array.get(fibLines, i))
+    for i = 0 to array.size(fibLabels) - 1
+        label.delete(array.get(fibLabels, i))
+    array.clear(fibLines)
+    array.clear(fibLabels)
+
+    if plotOk and not na(hiBand) and not na(sIdx)
+        int xR = bar_index + extendBars
+        lnHi := line.new(sIdx, hiBand, xR, hiBand, color = colHi, width = 1, style = line.style_dashed)
+        lnLo := line.new(sIdx, loBand, xR, loBand, color = colLo, width = 1, style = line.style_dashed)
+
+        if showLabels
+            lbHi := label.new(xR, hiBand, "AIR High  " + f_px(hiBand), xloc = xloc.bar_index,
+                 style = label.style_label_left, color = colHi, textcolor = color.white, size = size.small)
+            lbLo := label.new(xR, loBand, "AIR Low  " + f_px(loBand), xloc = xloc.bar_index,
+                 style = label.style_label_left, color = colLo, textcolor = color.white, size = size.small)
+            lbOp := label.new(xR, sOpen, "Open  " + f_px(sOpen), xloc = xloc.bar_index,
+                 style = label.style_label_left, color = colOpen, textcolor = color.black, size = size.small)
+
+        if showFib
+            fibs = array.from(0.236, 0.382, 0.5, 0.618, 0.786)
+            for i = 0 to array.size(fibs) - 1
+                float f  = array.get(fibs, i)
+                float lv = loBand + (hiBand - loBand) * f
+                ln = line.new(sIdx, lv, xR, lv, color = color.new(color.gray, 45), width = 1, style = line.style_dotted)
+                array.push(fibLines, ln)
+                lb = label.new(xR, lv, str.tostring(f) + " (" + f_px(lv) + ")", xloc = xloc.bar_index,
+                     style = label.style_none, textcolor = color.new(color.gray, 20), size = size.tiny)
+                array.push(fibLabels, lb)
+
+// =============================================================================
+//  TABLEAU STATISTIQUE
+// =============================================================================
+tblSize = tblSizeStr == "tiny" ? size.tiny : tblSizeStr == "normal" ? size.normal : size.small
+
+f_tblPos(s) =>
+    s == "top_right" ? position.top_right :
+     s == "middle_right" ? position.middle_right :
+     s == "top_left" ? position.top_left :
+     s == "bottom_left" ? position.bottom_left : position.bottom_right
+
+var table tbl = table.new(f_tblPos(tblPosStr), 2, 16, border_width = 1, border_color = color.new(#1e88a8, 40), frame_width = 1, frame_color = color.new(#1e88a8, 40))
+
+f_row(t, r, k, v, vc) =>
+    table.cell(t, 0, r, k, text_color = color.new(color.white, 10), text_size = tblSize, text_halign = text.align_left,  bgcolor = color.new(#0b1e2d, 10))
+    table.cell(t, 1, r, v, text_color = vc,                         text_size = tblSize, text_halign = text.align_right, bgcolor = color.new(#0b1e2d, 10))
+
+if barstate.islast and showTable
+    table.clear(tbl, 0, 0, 1, 15)
+    colNeutral = color.new(color.white, 0)
+    table.cell(tbl, 0, 0, "Indicateur", text_color = colHi, text_size = tblSize, bgcolor = color.new(#07141f, 0))
+    table.cell(tbl, 1, 0, "Valeur",     text_color = colHi, text_size = tblSize, bgcolor = color.new(#07141f, 0))
+    f_row(tbl, 1,  "Mode bandes",         bandMode, colNeutral)
+    f_row(tbl, 2,  "Séances",             na(nUsed) ? "n/a" : str.tostring(int(nUsed)), colNeutral)
+    f_row(tbl, 3,  "Range moyen H-L",     f_pt(cR),  colNeutral)
+    f_row(tbl, 4,  "Moy. High - Open",    f_pt(cHO), colHi)
+    f_row(tbl, 5,  "Moy. Open - Low",     f_pt(cLO), colLo)
+    f_row(tbl, 6,  "% touche bande haute", f_pc(tchHi), colHi)
+    f_row(tbl, 7,  "% touche bande basse", f_pc(tchLo), colLo)
+    f_row(tbl, 8,  "Range utilisé",       f_pc(rangeUsed), na(rangeUsed) ? colNeutral : rangeUsed >= 100 ? color.new(#ef5350, 0) : color.new(#ffc107, 0))
+    f_row(tbl, 9,  "Proj. H / L",         f_px(hiBand) + "  /  " + f_px(loBand), colNeutral)
+    f_row(tbl, 10, "Extension H / B",     f_px(extHiPx) + "  /  " + f_px(extLoPx), color.new(color.gray, 10))
+    f_row(tbl, 11, "Excursion haute util.", f_pc(upUsed) + "   (z " + f_pt(zUp) + ")", colHi)
+    f_row(tbl, 12, "Excursion basse util.", f_pc(dnUsed) + "   (z " + f_pt(zDn) + ")", colLo)
+    f_row(tbl, 13, "Moyenne " + str.tostring(maLen) + " séances", f_px(maVal), colMa)
+    f_row(tbl, 14, "Écart vs moyenne",    (na(devPts) ? "n/a" : (devPts >= 0 ? "+" : "") + f_pt(devPts) + "  (" + (devPct >= 0 ? "+" : "") + str.tostring(devPct, "#.##") + " %)"),
+         na(devPts) ? colNeutral : devPts >= 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0))
+    f_row(tbl, 15, "Z-score / % séances >", (na(devZ) ? "n/a" : str.tostring(devZ, "#.##")) + "   /   " + f_pc(pctAb),
+         na(devZ) ? colNeutral : math.abs(devZ) >= 2 ? color.new(#ffc107, 0) : colNeutral)
+
+// =============================================================================
+//  AVERTISSEMENT D'UNITÉ DE TEMPS
+// =============================================================================
+if barstate.islast and timeframe.in_seconds(timeframe.period) > timeframe.in_seconds("D")
+    label.new(bar_index, high, "AIR V3 : utiliser une unité de temps ≤ journalière",
+         style = label.style_label_down, color = color.new(#ef5350, 10), textcolor = color.white, size = size.small)
+
+// =============================================================================
+//  ALERTES
+// =============================================================================
+touchHi = plotOk and inSess and high >= hiBand and high[1] < hiBand[1]
+touchLo = plotOk and inSess and low  <= loBand and low[1]  > loBand[1]
+extHit  = plotOk and showExt and inSess and (high >= extHiPx or low <= extLoPx)
+devHigh = maOk and not na(devZ) and devZ >= devMult2 and nz(devZ[1]) < devMult2
+devLow  = maOk and not na(devZ) and devZ <= -devMult2 and nz(devZ[1]) > -devMult2
+
+alertcondition(touchHi, "AIR High atteint",  "Le prix a atteint la bande AIR haute (excursion moyenne consommée).")
+alertcondition(touchLo, "AIR Low atteint",   "Le prix a atteint la bande AIR basse (excursion moyenne consommée).")
+alertcondition(extHit,  "Extension atteinte", "Le prix a atteint la zone d'extension statistique de la séance.")
+alertcondition(devHigh, "Écart positif extrême", "Le prix est statistiquement haut par rapport à sa moyenne N séances.")
+alertcondition(devLow,  "Écart négatif extrême", "Le prix est statistiquement bas par rapport à sa moyenne N séances.")
